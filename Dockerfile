@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Stage 1: Build the Go binary
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /hostpathplugin ./cmd/hostpathplugin
+
+# Stage 2: Create the runtime image
 FROM alpine
 LABEL maintainers="Kubernetes Authors"
 LABEL description="HostPath Driver"
-ARG binary=./bin/hostpathplugin
-
-# Add util-linux to get a new version of losetup.
-RUN apk add util-linux coreutils socat tar && apk update && apk upgrade
-COPY ${binary} /hostpathplugin
+RUN apk add --no-cache util-linux coreutils socat tar
+COPY --from=builder /hostpathplugin /hostpathplugin
 ENTRYPOINT ["/hostpathplugin"]
