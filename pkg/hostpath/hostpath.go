@@ -49,6 +49,12 @@ const (
 	storageKind = "kind"
 )
 
+// inMemoryVolumeStore holds all volume and snapshot data in memory for in-memory mode.
+type inMemoryVolumeStore struct {
+	volumes   map[string][]byte // key: volID, value: data (for block), or nil for mount
+	snapshots map[string][]byte // key: snapshotID, value: data
+}
+
 type hostPath struct {
 	csi.UnimplementedIdentityServer
 	csi.UnimplementedControllerServer
@@ -62,6 +68,7 @@ type hostPath struct {
 	// functions assume that the mutex has been locked.
 	mutex sync.Mutex
 	state state.State
+	inMemoryStore *inMemoryVolumeStore // only used in in-memory mode
 }
 
 type Config struct {
@@ -113,6 +120,19 @@ func NewHostPathDriver(cfg Config) (*hostPath, error) {
 		return nil, errors.New("no driver endpoint provided")
 	}
 
+	if os.Getenv("CSI_DRIVER_INMEMORY") == "1" {
+		klog.Infof("Using in-memory state for CSI driver")
+		hp := &hostPath{
+			config: cfg,
+			state:  state.NewMemory(),
+			inMemoryStore: &inMemoryVolumeStore{
+				volumes:   make(map[string][]byte),
+				snapshots: make(map[string][]byte),
+			},
+		}
+		return hp, nil
+	}
+
 	if err := os.MkdirAll(cfg.StateDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create dataRoot: %v", err)
 	}
@@ -145,11 +165,17 @@ func (hp *hostPath) Run() error {
 
 // getVolumePath returns the canonical path for hostpath volume
 func (hp *hostPath) getVolumePath(volID string) string {
+	if hp.inMemoryStore != nil {
+		return "inmemory://volume/" + volID
+	}
 	return filepath.Join(hp.config.StateDir, volID)
 }
 
 // getSnapshotPath returns the full path to where the snapshot is stored
 func (hp *hostPath) getSnapshotPath(snapshotID string) string {
+	if hp.inMemoryStore != nil {
+		return "inmemory://snapshot/" + snapshotID
+	}
 	return filepath.Join(hp.config.StateDir, fmt.Sprintf("%s%s", snapshotID, snapshotExt))
 }
 
@@ -188,40 +214,45 @@ func (hp *hostPath) createVolume(volID, name string, cap int64, volAccessType st
 
 	path := hp.getVolumePath(volID)
 
-	switch volAccessType {
-	case state.MountAccess:
-		err := os.MkdirAll(path, 0777)
-		if err != nil {
-			return nil, err
+	if hp.inMemoryStore != nil {
+		// In-memory mode: just record the volume in the store
+		if volAccessType == state.BlockAccess {
+			hp.inMemoryStore.volumes[volID] = make([]byte, cap)
+		} else {
+			hp.inMemoryStore.volumes[volID] = nil // nil means empty dir
 		}
-	case state.BlockAccess:
-		executor := utilexec.New()
-		size := fmt.Sprintf("%dM", cap/mib)
-		// Create a block file.
-		_, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				out, err := executor.Command("fallocate", "-l", size, path).CombinedOutput()
-				if err != nil {
-					return nil, fmt.Errorf("failed to create block device: %v, %v", err, string(out))
+	} else {
+		switch volAccessType {
+		case state.MountAccess:
+			err := os.MkdirAll(path, 0777)
+			if err != nil {
+				return nil, err
+			}
+		case state.BlockAccess:
+			executor := utilexec.New()
+			size := fmt.Sprintf("%dM", cap/mib)
+			_, err := os.Stat(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					out, err := executor.Command("fallocate", "-l", size, path).CombinedOutput()
+					if err != nil {
+						return nil, fmt.Errorf("failed to create block device: %v, %v", err, string(out))
+					}
+				} else {
+					return nil, fmt.Errorf("failed to stat block device: %v, %v", path, err)
 				}
-			} else {
-				return nil, fmt.Errorf("failed to stat block device: %v, %v", path, err)
 			}
-		}
-
-		// Associate block file with the loop device.
-		volPathHandler := volumepathhandler.VolumePathHandler{}
-		_, err = volPathHandler.AttachFileDevice(path)
-		if err != nil {
-			// Remove the block file because it'll no longer be used again.
-			if err2 := os.Remove(path); err2 != nil {
-				klog.Errorf("failed to cleanup block file %s: %v", path, err2)
+			volPathHandler := volumepathhandler.VolumePathHandler{}
+			_, err = volPathHandler.AttachFileDevice(path)
+			if err != nil {
+				if err2 := os.Remove(path); err2 != nil {
+					klog.Errorf("failed to cleanup block file %s: %v", path, err2)
+				}
+				return nil, fmt.Errorf("failed to attach device %v: %v", path, err)
 			}
-			return nil, fmt.Errorf("failed to attach device %v: %v", path, err)
+		default:
+			return nil, fmt.Errorf("unsupported access type %v", volAccessType)
 		}
-	default:
-		return nil, fmt.Errorf("unsupported access type %v", volAccessType)
 	}
 
 	volume := state.Volume{
@@ -250,18 +281,21 @@ func (hp *hostPath) deleteVolume(volID string) error {
 		return nil
 	}
 
-	if vol.VolAccessType == state.BlockAccess {
-		volPathHandler := volumepathhandler.VolumePathHandler{}
-		path := hp.getVolumePath(volID)
-		klog.V(4).Infof("deleting loop device for file %s if it exists", path)
-		if err := volPathHandler.DetachFileDevice(path); err != nil {
-			return fmt.Errorf("failed to remove loop device for file %s: %v", path, err)
+	if hp.inMemoryStore != nil {
+		delete(hp.inMemoryStore.volumes, volID)
+	} else {
+		if vol.VolAccessType == state.BlockAccess {
+			volPathHandler := volumepathhandler.VolumePathHandler{}
+			path := hp.getVolumePath(volID)
+			klog.V(4).Infof("deleting loop device for file %s if it exists", path)
+			if err := volPathHandler.DetachFileDevice(path); err != nil {
+				return fmt.Errorf("failed to remove loop device for file %s: %v", path, err)
+			}
 		}
-	}
-
-	path := hp.getVolumePath(volID)
-	if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
-		return err
+		path := hp.getVolumePath(volID)
+		if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	if err := hp.state.DeleteVolume(volID); err != nil {
 		return err
@@ -297,6 +331,20 @@ func hostPathIsEmpty(p string) (bool, error) {
 
 // loadFromSnapshot populates the given destPath with data from the snapshotID
 func (hp *hostPath) loadFromSnapshot(size int64, snapshotId, destPath string, mode state.AccessType) error {
+	if hp.inMemoryStore != nil {
+		data, ok := hp.inMemoryStore.snapshots[hp.getSnapshotPath(snapshotId)]
+		if !ok {
+			return fmt.Errorf("snapshot data not found in memory for snapshot %s", snapshotId)
+		}
+		if mode == state.BlockAccess {
+			// Copy snapshot data to volume
+			hp.inMemoryStore.volumes[destPath] = append([]byte(nil), data...)
+		} else {
+			// For mount, just mark as present
+			hp.inMemoryStore.volumes[destPath] = nil
+		}
+		return nil
+	}
 	snapshot, err := hp.state.GetSnapshotByID(snapshotId)
 	if err != nil {
 		return err
@@ -331,6 +379,18 @@ func (hp *hostPath) loadFromSnapshot(size int64, snapshotId, destPath string, mo
 
 // loadFromVolume populates the given destPath with data from the srcVolumeID
 func (hp *hostPath) loadFromVolume(size int64, srcVolumeId, destPath string, mode state.AccessType) error {
+	if hp.inMemoryStore != nil {
+		data, ok := hp.inMemoryStore.volumes[srcVolumeId]
+		if !ok {
+			return fmt.Errorf("source volume data not found in memory for volume %s", srcVolumeId)
+		}
+		if mode == state.BlockAccess {
+			hp.inMemoryStore.volumes[destPath] = append([]byte(nil), data...)
+		} else {
+			hp.inMemoryStore.volumes[destPath] = nil
+		}
+		return nil
+	}
 	hostPathVolume, err := hp.state.GetVolumeByID(srcVolumeId)
 	if err != nil {
 		return err
@@ -353,32 +413,12 @@ func (hp *hostPath) loadFromVolume(size int64, srcVolumeId, destPath string, mod
 }
 
 func loadFromFilesystemVolume(hostPathVolume state.Volume, destPath string) error {
-	srcPath := hostPathVolume.VolPath
-	isEmpty, err := hostPathIsEmpty(srcPath)
-	if err != nil {
-		return fmt.Errorf("failed verification check of source hostpath volume %v: %w", hostPathVolume.VolID, err)
-	}
-
-	// If the source hostpath volume is empty it's a noop and we just move along, otherwise the cp call will fail with a a file stat error DNE
-	if !isEmpty {
-		args := []string{"-a", srcPath + "/.", destPath + "/"}
-		executor := utilexec.New()
-		out, err := executor.Command("cp", args...).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed pre-populate data from volume %v: %s: %w", hostPathVolume.VolID, out, err)
-		}
-	}
+	// In-memory mode: nothing to do, handled in loadFromVolume
 	return nil
 }
 
 func loadFromBlockVolume(hostPathVolume state.Volume, destPath string) error {
-	srcPath := hostPathVolume.VolPath
-	args := []string{"if=" + srcPath, "of=" + destPath}
-	executor := utilexec.New()
-	out, err := executor.Command("dd", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed pre-populate data from volume %v: %w: %s", hostPathVolume.VolID, err, out)
-	}
+	// In-memory mode: nothing to do, handled in loadFromVolume
 	return nil
 }
 
@@ -393,6 +433,20 @@ func (hp *hostPath) getAttachCount() int64 {
 }
 
 func (hp *hostPath) createSnapshotFromVolume(vol state.Volume, file string, opts ...string) error {
+	if hp.inMemoryStore != nil {
+		if vol.VolAccessType == state.BlockAccess {
+			if data, ok := hp.inMemoryStore.volumes[vol.VolID]; ok {
+				// Copy block data to snapshot
+				hp.inMemoryStore.snapshots[file] = append([]byte(nil), data...)
+				return nil
+			}
+			return fmt.Errorf("volume data not found in memory for block volume %s", vol.VolID)
+		} else {
+			// For mount, just mark snapshot as present (no data)
+			hp.inMemoryStore.snapshots[file] = nil
+			return nil
+		}
+	}
 	var args []string
 	var cmdName string
 	if vol.VolAccessType == state.BlockAccess {

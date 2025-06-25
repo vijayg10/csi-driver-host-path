@@ -204,7 +204,11 @@ func (hp *hostPath) DeleteVolumeGroupSnapshot(ctx context.Context, req *csi.Dele
 	for _, snapshotID := range groupSnapshot.SnapshotIDs {
 		klog.V(4).Infof("deleting snapshot %s", snapshotID)
 		path := hp.getSnapshotPath(snapshotID)
-		os.RemoveAll(path)
+		if hp.inMemoryStore != nil {
+			delete(hp.inMemoryStore.snapshots, path)
+		} else {
+			os.RemoveAll(path)
+		}
 
 		if err := hp.state.DeleteSnapshot(snapshotID); err != nil {
 			return nil, err
